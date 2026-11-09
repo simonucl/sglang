@@ -171,6 +171,9 @@ from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     is_cross_layer_mhc_fusion_enabled,
 )
+from sglang.srt.models.deepseek_common.checkpoint_page_release import (
+    release_consumed_checkpoint_pages,
+)
 from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     enter_late_layer_dp,
     exit_late_layer_dp,
@@ -5413,6 +5416,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
+        weights = release_consumed_checkpoint_pages(weights)
         if not (self.wo_a_fp8 or self.use_npu_arch35_mxfp8_wo_a):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 

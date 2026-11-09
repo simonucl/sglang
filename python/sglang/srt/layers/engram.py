@@ -653,6 +653,63 @@ def drop_checkpoint_page_cache() -> tuple[int, int]:
     return files, nbytes
 
 
+# Arbitrary; bounds the checkpoint pages one host-table load keeps resident.
+_HOST_LOAD_CHUNK_BYTES = 256 << 20
+_MADV_DONTNEED = 4
+
+
+@functools.cache
+def _libc() -> ctypes.CDLL:
+    return ctypes.CDLL(None, use_errno=True)
+
+
+def _safetensors_mapping_bounds(ptr: int) -> Optional[tuple[int, int]]:
+    """The ``*.safetensors`` file mapping of this process that holds ``ptr``."""
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            parts = line.split()
+            if len(parts) >= 6 and parts[5].endswith(".safetensors"):
+                lo, hi = (int(x, 16) for x in parts[0].split("-"))
+                if lo <= ptr < hi:
+                    return lo, hi
+    return None
+
+
+def _copy_releasing_checkpoint_pages(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """``dst.copy_(src)`` into a host table, in row chunks that drop each chunk's
+    checkpoint pages (MADV_DONTNEED) once copied: otherwise every page of the
+    rank's ~24 GiB slice stays resident beside the table until loading ends. The
+    pages are clean file pages, so any later read refaults them from the file."""
+    bounds = (
+        _safetensors_mapping_bounds(src.data_ptr())
+        if src.device.type == "cpu"
+        and dst.device.type == "cpu"
+        and src.dim() >= 1
+        and src.shape == dst.shape
+        and src.numel() > 0
+        and src.is_contiguous()
+        and dst.is_contiguous()
+        else None
+    )
+    if bounds is None:
+        dst.copy_(src)
+        return
+    row_bytes = src.stride(0) * src.element_size()
+    rows_per_chunk = max(1, _HOST_LOAD_CHUNK_BYTES // max(1, row_bytes))
+    page = mmap.PAGESIZE
+    base = src.data_ptr()
+    for start in range(0, src.shape[0], rows_per_chunk):
+        end = min(src.shape[0], start + rows_per_chunk)
+        dst[start:end].copy_(src[start:end])
+        # Whole pages inside this chunk only; its boundary pages stay mapped.
+        lo = max(bounds[0], -(-(base + start * row_bytes) // page) * page)
+        hi = min(bounds[1], (base + end * row_bytes) // page * page)
+        if hi > lo:
+            _libc().madvise(
+                ctypes.c_void_p(lo), ctypes.c_size_t(hi - lo), _MADV_DONTNEED
+            )
+
+
 def _drop_page_cache_once(reason: str) -> None:
     global _page_cache_dropped
     if _page_cache_dropped:
@@ -1200,9 +1257,11 @@ class EngramEmbedding(nn.Module):
             f"{dst.dtype} {tuple(dst.shape)}; an MXFP4 table needs "
             "quantization_config.engram_embed_quant = 'mxfp4'"
         )
-        dst.copy_(src)
         if self.host_table is not None:
+            _copy_releasing_checkpoint_pages(dst, loaded_weight[rows])
             self.host_table.dirty = True
+        else:
+            dst.copy_(loaded_weight[rows])
 
     def finish_load(self, label: str):
         """Collective in the shared layout and with peer shards: every rank calls
